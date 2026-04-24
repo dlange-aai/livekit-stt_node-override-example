@@ -7,38 +7,40 @@ production voice agent, stripped of recording, logging, and tool calls
 so the only thing on display is ``stt_node`` filtering.
 
 The filter drops STT events whose transcript is entirely backchannel /
-filler tokens (e.g. "mhm", "yeah", "okay") while the agent is speaking.
-Downstream turn detection, interrupt gates, and preemptive generation
-never see those events, so the agent doesn't get cut off mid-sentence.
-Events pass through unchanged when the agent is not speaking — a bare
-"yeah" at listening time still lands normally.
+filler tokens (e.g. "mhm", "yeah", "okay") while the agent is speaking
+(plus a short grace window after). Without the filter, a mid-speech
+"um" commits as a one-word user turn and the LLM dutifully replies
+to it.
 
-Note on VAD: this demo sets ``vad=None`` on purpose. With VAD enabled
-and ``interruption.enabled=True``, Silero's speaking signal pauses TTS
-and flips ``session.agent_state`` to ``"listening"`` before the STT
-transcript reaches our filter — so the "speaking" branch never fires
-and the filter can't do its job. Turn detection still works fine
-without VAD via ``EnglishModel``; interrupts come from committed STT
-turns (``on_end_of_turn``), which run after ``stt_node`` yields.
+VAD is deliberately disabled. With ``turn_detection="stt"`` +
+``vad=None``, ``agent_state`` stays ``"speaking"`` through TTS and
+the filter's "are we speaking?" gate answers reliably. Interrupts
+still come from committed STT turns (``on_end_of_turn``), which run
+after ``stt_node`` yields — so a real user intent is caught by
+AssemblyAI's end-of-turn signal but a filler we dropped never makes
+it that far.
 """
 
 from __future__ import annotations
 
 import string
+import time
 from collections.abc import AsyncIterable
 from pathlib import Path
 
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession, room_io, stt
+from livekit.agents import Agent, AgentSession, stt
 from livekit.agents.voice import ModelSettings
 from livekit.plugins import (
     assemblyai,
     cartesia,
-    noise_cancellation,
     openai,
 )
-from livekit.plugins.turn_detector.english import EnglishModel
+
+# Uncomment for telephony calls that need noise cancellation.
+# Requires the `livekit-plugins-noise-cancellation` package.
+# from livekit.plugins import noise_cancellation
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
@@ -100,8 +102,15 @@ booking from the top unless they ask.\
 
 
 class HotelBookingAgent(Agent):
+    # Keep filtering for this long after agent_state flips off "speaking".
+    # Covers the latency between TTS finishing and AssemblyAI's late
+    # FINAL_TRANSCRIPT arriving — without this, a filler uttered right
+    # before TTS ends can still commit as a user turn a moment later.
+    _FILTER_GRACE_S = 1.0
+
     def __init__(self) -> None:
         super().__init__(instructions=HOTEL_SYSTEM_PROMPT)
+        self._last_speaking_at = 0.0
 
     async def stt_node(
         self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
@@ -119,14 +128,17 @@ class HotelBookingAgent(Agent):
 
     def _should_drop(self, ev: stt.SpeechEvent) -> bool:
         # Three gates, cheapest first:
-        #   1. Only filter while the agent is actively speaking — at
-        #      listening / thinking time a bare "yeah" is a real
+        #   1. Filter while the agent is speaking OR within a short
+        #      grace after — past the grace, a bare "yeah" is a real
         #      confirmation and must flow through.
         #   2. Only touch transcript events (INTERIM / PREFLIGHT / FINAL).
         #      START_OF_SPEECH / END_OF_SPEECH carry no text and the
         #      downstream state machine needs them.
         #   3. Drop only when the transcript is entirely filler.
-        if self.session.agent_state != "speaking":
+        now = time.monotonic()
+        if self.session.agent_state == "speaking":
+            self._last_speaking_at = now
+        elif now - self._last_speaking_at > self._FILTER_GRACE_S:
             return False
         if ev.type not in _TRANSCRIPT_TYPES:
             return False
@@ -140,29 +152,19 @@ async def entrypoint(ctx: agents.JobContext):
     session = AgentSession(
         stt=assemblyai.STT(
             model="u3-rt-pro",
-            min_turn_silence=200,
-            max_turn_silence=1500,
-            vad_threshold=0.3,
-            keyterms_prompt=[
-                "SpringHill",
-                "TownePlace",
-                "WoodSpring",
-                "DoubleTree",
-                "Hilton",
-                "Marriott",
-                "Bonvoy",
-                "suite",
-                "valet",
-            ],
+            min_turn_silence=100,
+            max_turn_silence=1000,
+            vad_threshold=0.3
         ),
         tts=cartesia.TTS(model="sonic-3", voice="607167f6-9bf2-473c-accc-ac7b3b66b30b"),
         llm=openai.LLM(model="gpt-4.1-nano"),
-        # VAD is deliberately disabled — see module docstring. Turn
-        # detection is handled by EnglishModel below; interrupts come
-        # out of the STT-commit path (on_end_of_turn).
+        # VAD is disabled — with turn_detection="stt", agent_state
+        # stays "speaking" through TTS, so the filter's speaking-gate
+        # answers reliably and fillers are dropped before they can
+        # trigger an interrupt.
         vad=None,
         turn_handling={
-            "turn_detection": EnglishModel(),
+            "turn_detection": "stt",
             "endpointing": {"min_delay": 1.0, "max_delay": 4.0},
             "interruption": {
                 "enabled": True,
@@ -174,14 +176,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=HotelBookingAgent(),
-        # Uncomment for telephony calls that need noise cancellation.
-        # Requires the `livekit-plugins-noise-cancellation` package.
-        # room_options=room_io.RoomOptions(
-        #     audio_input=room_io.AudioInputOptions(
-        #         noise_cancellation=noise_cancellation.BVCTelephony(),
-        #     ),
-        # ),
+        agent=HotelBookingAgent()
     )
 
     await session.generate_reply(
@@ -193,6 +188,5 @@ if __name__ == "__main__":
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
-            agent_name="hotel-booking-agent",
         )
     )

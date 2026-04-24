@@ -3,7 +3,6 @@ livekit-agents>=1.5
 livekit-plugins-assemblyai>=1.5
 livekit-plugins-cartesia>=1.5
 livekit-plugins-openai>=1.5
-livekit-plugins-turn-detector>=1.5
 
 # Optional — only needed if you uncomment the telephony noise-cancellation
 # block in agent.py
