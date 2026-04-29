@@ -1,8 +1,4 @@
-# LiveKit short-utterance interruption filters — two approaches
-
-<!-- TODO(rename): the GitHub repo + local dir is still
-livekit-stt_node-override-example, which now misleads. Rename to something
-like livekit-short-utterance-interruption-filters once both examples land. -->
+# livekit-interruption-filters
 
 Three minimal [LiveKit Agents](https://github.com/livekit/agents) voice
 agents that solve the same problem different ways: stop a caller's
