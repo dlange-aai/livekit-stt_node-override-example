@@ -25,8 +25,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Make the repo root importable so ``from filters.X import Y`` works
-# regardless of where you launch this script from.
+# Repo root on sys.path so ``from filters.X import Y`` works regardless
+# of the launch directory — the demo lives in a subfolder, the portable
+# filter modules don't.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
@@ -39,6 +40,7 @@ from livekit.plugins import (
 )
 
 from filters.backchannel_stt import BackchannelSTTFilterMixin
+from filters.debug_logging import install_session_event_logging, setup_demo_logging
 
 # Uncomment for telephony calls that need noise cancellation.
 # Requires the `livekit-plugins-noise-cancellation` package.
@@ -72,13 +74,13 @@ booking from the top unless they ask.\
 
 
 class HotelBookingAgent(BackchannelSTTFilterMixin, Agent):
-    # MRO puts BackchannelSTTFilterMixin.stt_node ahead of Agent's, so the
-    # backchannel filter runs on every STT event before downstream consumers.
+    # Mixin must come before Agent so MRO finds its stt_node first.
     def __init__(self) -> None:
         super().__init__(instructions=HOTEL_SYSTEM_PROMPT)
 
 
 async def entrypoint(ctx: agents.JobContext):
+    setup_demo_logging()
     await ctx.connect()
 
     session = AgentSession(
@@ -90,10 +92,10 @@ async def entrypoint(ctx: agents.JobContext):
         ),
         tts=cartesia.TTS(model="sonic-3", voice="607167f6-9bf2-473c-accc-ac7b3b66b30b"),
         llm=openai.LLM(model="gpt-4.1-nano"),
-        # VAD off — with turn_detection="stt", agent_state stays
-        # "speaking" through TTS, so the filter's speaking-gate answers
-        # reliably and fillers are dropped before they trigger an
-        # interrupt.
+        # VAD off + turn_detection="stt" is required for this filter to
+        # work reliably — Silero VAD would interrupt on raw audio
+        # activity before the transcript-level filter ever sees the
+        # event. See README "Why this setup is optimal".
         vad=None,
         turn_handling={
             "turn_detection": "stt",
@@ -105,6 +107,8 @@ async def entrypoint(ctx: agents.JobContext):
             },
         },
     )
+
+    install_session_event_logging(session)
 
     await session.start(room=ctx.room, agent=HotelBookingAgent())
 

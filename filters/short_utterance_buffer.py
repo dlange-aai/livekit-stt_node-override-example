@@ -3,14 +3,26 @@ Short-utterance buffer-clearing filter.
 
 Listens on ``user_input_transcribed`` and, while the agent is speaking,
 wipes the three transcript buffers LK's interrupt + preempt gates read
-from. With the buffers empty, the next gate check after a short
-utterance ("mhm" / "um") sees nothing accumulated and doesn't trip.
+from. The handler runs synchronously inside ``audio_recognition``'s
+``on_interim_transcript`` / ``on_final_transcript`` hook (line 728 /
+line 822 in audio_recognition.py 1.5.6), *before* LK's
+``_interrupt_by_audio_activity`` reads ``current_transcript`` — so the
+immediate TTS-pause path bails on ``min_words``.
+
+The wipe does not, however, keep ``_audio_transcript`` empty for EOU
+detection: audio_recognition appends the FINAL's transcript at line 743
+*after* the hook returns, so by EOU time the buffer holds the latest
+filler. Suppression of the turn commit comes from
+``agent_activity.on_end_of_turn``'s own ``min_words`` check
+(agent_activity.py:1871-1883). The wipe's value is preventing
+``_audio_transcript`` from accumulating multiple short fillers across
+uncommitted turns — without it, two consecutive short fillers sum past
+the threshold and break through.
 
 Why a function (and not a mixin): the integration point here is
 ``session.on("user_input_transcribed")`` — runtime event subscription
 on an already-instantiated ``AgentSession``. Nothing to override; just
-a callback to attach. The natural shape for "take an object, register
-behavior on it" is ``install_X(obj)``. (Compare
+a callback to attach. (Compare
 ``backchannel_stt.BackchannelSTTFilterMixin``, which is a class
 because *its* integration point — ``Agent.stt_node`` — is a method.)
 
@@ -18,8 +30,9 @@ Drop into your project as a single file. Imports only
 ``livekit.agents.AgentSession`` typing + stdlib — no other deps.
 
 Couples to LK private API: ``_activity._audio_recognition._audio_*`` and
-``_cancel_preemptive_generation``. Pin your ``livekit-agents`` version.
-Confirmed against ``livekit-agents>=1.5``.
+``_cancel_preemptive_generation``. Requires
+``interruption.min_words >= 1`` (the demo uses 2). Pin your
+``livekit-agents`` version. Confirmed against ``livekit-agents>=1.5``.
 """
 
 from __future__ import annotations
@@ -33,54 +46,47 @@ log = logging.getLogger("short_utterance_buffer_filter")
 
 
 def install_short_utterance_filter(session: AgentSession) -> None:
-    # Drops short utterances spoken while the agent is talking by
-    # clearing LK's accumulated transcript state before the interrupt
-    # gate reads it.
-    #
-    # Why all three buffers:
-    #   * _audio_transcript          — cumulative committed finals; read
-    #                                  by _interrupt_by_audio_activity
-    #                                  to decide whether the user has
-    #                                  said enough to interrupt.
-    #   * _audio_interim_transcript  — current interim chunk;
-    #                                  concatenated with the above to
-    #                                  form current_transcript.
-    #   * _audio_preflight_transcript — buffer + current preflight; used
-    #                                  by on_preemptive_generation to
-    #                                  decide whether to spin up a
-    #                                  speculative reply.
-    #
-    # Leaving any populated lets the next gate check tip over even though
-    # the *current* utterance is short.
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(ev) -> None:
-        # Gate 1 — only filter while the agent is producing TTS. When
-        # idle, short answers like "yes" / "no" are real turns.
-        if session.agent_state != "speaking":
-            return
-
-        # Gate 2 — let utterances at or above the configured threshold
-        # pass. Real intents that happen to be short ("the suite")
-        # still interrupt, by design.
         word_count = len(ev.transcript.split())
         min_words = session.options.interruption["min_words"]
+        log.debug(
+            "event_received transcript=%r is_final=%s words=%d agent_state=%s min_words=%d",
+            ev.transcript, ev.is_final, word_count, session.agent_state, min_words,
+        )
+
+        if session.agent_state != "speaking":
+            log.debug("kept reason='agent idle' agent_state=%s", session.agent_state)
+            return
+
         if word_count >= min_words:
+            log.debug(
+                "kept reason='word_count >= min_words' words=%d min_words=%d",
+                word_count, min_words,
+            )
             return
 
         # getattr+default keeps us safe if the session is mid-init or
-        # torn down.
+        # mid-teardown — _activity / _audio_recognition can be None.
         activity = getattr(session, "_activity", None)
         recognition = getattr(activity, "_audio_recognition", None) if activity else None
         if recognition is None:
             return
+
+        log.debug(
+            "buffer_snapshot before_wipe transcript=%r interim=%r preflight=%r",
+            recognition._audio_transcript,
+            recognition._audio_interim_transcript,
+            recognition._audio_preflight_transcript,
+        )
+
         recognition._audio_transcript = ""
         recognition._audio_interim_transcript = ""
         recognition._audio_preflight_transcript = ""
 
-        # If LK already kicked off a preemptive LLM call on the
-        # preflight of this short utterance, abort it before TTS
-        # starts. Best-effort — if TTS already began, we accept the
-        # small race.
+        # Best-effort: aborts any in-flight preemptive LLM call kicked
+        # off on this short utterance's preflight. Wrapped because the
+        # private method could change shape on a minor-version bump.
         cancel = getattr(activity, "_cancel_preemptive_generation", None)
         if callable(cancel):
             try:

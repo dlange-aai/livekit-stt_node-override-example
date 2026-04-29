@@ -34,8 +34,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Make the repo root importable so ``from filters.X import Y`` works
-# regardless of where you launch this script from.
+# Repo root on sys.path so ``from filters.X import Y`` works regardless
+# of the launch directory — the demo lives in a subfolder, the portable
+# filter modules don't.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
@@ -47,6 +48,7 @@ from livekit.plugins import (
     openai,
 )
 
+from filters.debug_logging import install_session_event_logging, setup_demo_logging
 from filters.short_utterance_buffer import install_short_utterance_filter
 
 # Uncomment for telephony calls that need noise cancellation.
@@ -86,6 +88,7 @@ class HotelBookingAgent(Agent):
 
 
 async def entrypoint(ctx: agents.JobContext):
+    setup_demo_logging()
     await ctx.connect()
 
     session = AgentSession(
@@ -97,10 +100,8 @@ async def entrypoint(ctx: agents.JobContext):
         ),
         tts=cartesia.TTS(model="sonic-3", voice="607167f6-9bf2-473c-accc-ac7b3b66b30b"),
         llm=openai.LLM(model="gpt-4.1-nano"),
-        # VAD off — with turn_detection="stt", agent_state stays
-        # "speaking" through TTS, so the filter's speaking-gate answers
-        # reliably and short utterances can be cleared before they
-        # trigger an interrupt.
+        # VAD off + turn_detection="stt" is the recommended setup for
+        # this filter. See README "Why this setup is optimal".
         vad=None,
         turn_handling={
             "turn_detection": "stt",
@@ -109,14 +110,15 @@ async def entrypoint(ctx: agents.JobContext):
                 "enabled": True,
                 "resume_false_interruption": True,
                 "false_interruption_timeout": 1.5,
-                # Anything shorter than this gets the buffer wiped while
-                # the agent is speaking. Default is 0 (off), so we set
-                # it explicitly to give the filter something to gate on.
+                # Default is 0 (gate disabled). The buffer-clearer's
+                # word-count gate reads this, so it must be set
+                # explicitly to take effect.
                 "min_words": 2,
             },
         },
     )
 
+    install_session_event_logging(session)
     install_short_utterance_filter(session)
 
     await session.start(room=ctx.room, agent=HotelBookingAgent())

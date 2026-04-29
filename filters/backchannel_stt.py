@@ -39,8 +39,8 @@ from livekit.agents import Agent, stt
 from livekit.agents.voice import ModelSettings
 
 
-# Edit for your domain. "yes" / "no" deliberately omitted — in a
-# booking flow a bare "yes" is a real confirmation.
+# "yes" / "no" deliberately omitted — in a booking flow a bare "yes"
+# is a real confirmation. Edit for your domain.
 BACKCHANNELS = frozenset({
     "mhm", "mm", "mmhm", "mmhmm",
     "uh", "uhhuh", "huh",
@@ -65,32 +65,32 @@ log = logging.getLogger("backchannel_stt_filter")
 
 
 def _is_all_backchannel(text: str) -> bool:
-    # True only if the transcript has content AND every token is a known
-    # filler. One non-filler word anywhere ("yeah I want the suite") flips
-    # this to False so real intents are never dropped.
+    # One non-filler token anywhere flips the result to False, so a
+    # real intent that starts with a filler ("yeah I want the suite")
+    # is never dropped.
     tokens = text.lower().translate(_PUNCT_STRIP).split()
     return bool(tokens) and all(tok in BACKCHANNELS for tok in tokens)
 
 
 class BackchannelSTTFilterMixin:
     # Keep filtering this long after agent_state flips off "speaking".
-    # Covers AssemblyAI's late FINAL_TRANSCRIPT — without this, a filler
-    # uttered right before TTS ends can still commit as a user turn a
-    # moment later.
+    # Without the grace, a filler uttered right before TTS ends can
+    # still be finalized by AssemblyAI a few hundred ms later and
+    # commit as a user turn.
     _FILTER_GRACE_S: float = 1.0
 
-    # Class-level default; set per-instance on first observation of
-    # agent_state == "speaking".
     _last_speaking_at: float = 0.0
 
     async def stt_node(
         self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
     ):
-        # Filter event stream before it reaches downstream consumers
-        # (audio_recognition -> turn detection, interrupt gates,
-        # preemptive generation). Dropping a transcript event here means
-        # it's as if the STT never emitted it.
         async for ev in Agent.default.stt_node(self, audio, model_settings):
+            if log.isEnabledFor(logging.DEBUG) and ev.type in _TRANSCRIPT_TYPES:
+                seen_text = ev.alternatives[0].text if ev.alternatives else ""
+                log.debug(
+                    "transcript_seen text=%r type=%s agent_state=%s",
+                    seen_text, ev.type, self.session.agent_state,
+                )
             if self._should_drop(ev):
                 text = ev.alternatives[0].text if ev.alternatives else ""
                 log.info(
@@ -101,18 +101,18 @@ class BackchannelSTTFilterMixin:
             yield ev
 
     def _should_drop(self, ev: stt.SpeechEvent) -> bool:
-        # Three gates, cheapest first:
-        #   1. Filter while agent is speaking OR within grace — past
-        #      grace, a bare "yeah" is a real confirmation.
-        #   2. Only touch transcript events. START/END_OF_SPEECH carry
-        #      no text and the downstream state machine needs them.
-        #   3. Drop only when the transcript is entirely filler.
         now = time.monotonic()
         if self.session.agent_state == "speaking":
             self._last_speaking_at = now
         elif now - self._last_speaking_at > self._FILTER_GRACE_S:
+            if log.isEnabledFor(logging.DEBUG) and ev.type in _TRANSCRIPT_TYPES:
+                text = ev.alternatives[0].text if ev.alternatives else ""
+                log.debug("kept text=%r reason='past grace window'", text)
             return False
         if ev.type not in _TRANSCRIPT_TYPES:
             return False
         text = ev.alternatives[0].text if ev.alternatives else ""
-        return _is_all_backchannel(text)
+        if _is_all_backchannel(text):
+            return True
+        log.debug("kept text=%r reason='non-filler tokens present'", text)
+        return False
