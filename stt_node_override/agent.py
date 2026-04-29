@@ -23,6 +23,7 @@ it that far.
 
 from __future__ import annotations
 
+import logging
 import string
 import time
 from collections.abc import AsyncIterable
@@ -42,7 +43,9 @@ from livekit.plugins import (
 # Requires the `livekit-plugins-noise-cancellation` package.
 # from livekit.plugins import noise_cancellation
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+
+log = logging.getLogger("stt_node_override_agent")
 
 
 # Backchannels / fillers to drop while the agent is speaking.
@@ -123,6 +126,11 @@ class HotelBookingAgent(Agent):
         # forwarded untouched.
         async for ev in Agent.default.stt_node(self, audio, model_settings):
             if self._should_drop(ev):
+                text = ev.alternatives[0].text if ev.alternatives else ""
+                log.info(
+                    "event_filtered transcript=%r ev_type=%s agent_state=%s",
+                    text, ev.type, self.session.agent_state,
+                )
                 continue
             yield ev
 
