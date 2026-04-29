@@ -4,14 +4,34 @@
 livekit-stt_node-override-example, which now misleads. Rename to something
 like livekit-short-utterance-interruption-filters once both examples land. -->
 
-Two minimal [LiveKit Agents](https://github.com/livekit/agents) voice
-agents that solve the same problem two different ways: stop a caller's
+Three minimal [LiveKit Agents](https://github.com/livekit/agents) voice
+agents that solve the same problem different ways: stop a caller's
 **short backchannel utterances** ("mhm", "um", "yeah") from interrupting
 the agent mid-speech.
 
-Both examples use the same hotel front-desk demo so the only thing that
-differs between them is the filter mechanism. Pick whichever fits your
-codebase and constraints.
+All three examples use the same hotel front-desk demo so the only thing
+that differs between them is the filter mechanism. Pick whichever fits
+your codebase and constraints — or run both together (Strategy 3) for
+layered coverage.
+
+## Layout
+
+```
+filters/                       # Portable filter modules — drop these into
+├── backchannel_stt.py         # your own LiveKit project. Each file imports
+└── short_utterance_buffer.py  # only livekit + stdlib, nothing from this repo.
+
+stt_node_override/agent.py     # Strategy 1 demo — backchannel STT filter only.
+buffer_clearing/agent.py       # Strategy 2 demo — buffer-clearer only.
+combined/agent.py              # Strategy 3 demo — both filters layered.
+```
+
+Each `agent.py` is a self-contained, runnable hotel-front-desk demo:
+prompt + agent class + session config + entrypoint, all in one file.
+The only cross-file import is the filter you're showcasing — that's
+the point of the repo. Read `agent.py` top-to-bottom and you can see
+the entire setup; copy `filters/<your-pick>.py` into your own project
+to apply the same strategy.
 
 ## Stack
 
@@ -20,24 +40,25 @@ codebase and constraints.
 - **Cartesia (`sonic-3`)** — TTS
 - **OpenAI (`gpt-4.1-nano`)** — LLM
 
-## The two strategies at a glance
+## The three strategies at a glance
 
-|                           | `stt_node` override                                                       | Buffer clearing                                                                       |
-|---------------------------|---------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
-| Where it sits             | Wraps `Agent.stt_node`, drops events upstream of `audio_recognition`      | Listens on `user_input_transcribed`, clears LK private buffers                        |
-| What it filters on        | A configured set of backchannel tokens (`"mhm"`, `"um"`, …)               | Word count below `interruption.min_words` (anything shorter is dropped while talking) |
-| LK internals touched      | None — `stt_node` is a public override point                              | Three private attrs + one private method                                              |
-| Best for                  | Domains with a known finite filler list                                   | Domains where any short utterance during agent speech should not interrupt            |
-| Risk                      | An unknown short filler ("aha") slips through                             | Couples to LK private API — pin `livekit-agents`                                      |
-| File                      | [`stt_node_override/agent.py`](./stt_node_override/agent.py)              | [`buffer_clearing/agent.py`](./buffer_clearing/agent.py)                              |
+|                       | `stt_node` override                                                  | Buffer clearing                                                                       | Combined                                                                                          |
+|-----------------------|----------------------------------------------------------------------|---------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| Where it sits         | Wraps `Agent.stt_node`, drops events upstream of `audio_recognition` | Listens on `user_input_transcribed`, clears LK private buffers                        | Both, layered                                                                                     |
+| What it filters on    | A configured set of backchannel tokens (`"mhm"`, `"um"`, …)          | Word count below `interruption.min_words` (anything shorter is dropped while talking) | Tokens upstream + word count downstream                                                           |
+| LK internals touched  | None — `stt_node` is a public override point                         | Three private attrs + one private method                                              | Same private surface as Strategy 2                                                                |
+| Best for              | Domains with a known finite filler list                              | Domains where any short utterance during agent speech should not interrupt            | When you want both: known fillers stopped cheaply at the source, novel short utterances mopped up |
+| Risk                  | An unknown short filler ("aha") slips through                        | Couples to LK private API — pin `livekit-agents`                                      | Inherits Strategy 2's private-API coupling                                                        |
+| File                  | [`stt_node_override/agent.py`](./stt_node_override/agent.py)         | [`buffer_clearing/agent.py`](./buffer_clearing/agent.py)                              | [`combined/agent.py`](./combined/agent.py)                                                        |
 
-Both rely on the same LK config: `vad=None` + `turn_detection="stt"`. With
-VAD off, the only interrupt path is a committed STT turn, which both
-strategies sit upstream of.
+All three strategies rely on the same LK config: `vad=None` +
+`turn_detection="stt"`. With VAD off, the only interrupt path is a
+committed STT turn, which every strategy sits upstream of.
 
 ## Strategy 1 — `stt_node` override
 
-[`stt_node_override/agent.py`](./stt_node_override/agent.py)
+Demo: [`stt_node_override/agent.py`](./stt_node_override/agent.py)
+· Portable filter: [`filters/backchannel_stt.py`](./filters/backchannel_stt.py)
 
 Override `Agent.stt_node` and drop short backchannel-only events from
 the STT stream before they reach LiveKit's downstream interrupt /
@@ -144,8 +165,8 @@ Three gates, cheapest first:
 
 ### Tuning the filler list
 
-`BACKCHANNELS` in `stt_node_override/agent.py` is a `frozenset` of
-lowercase tokens. Edit for your domain:
+`BACKCHANNELS` in [`filters/backchannel_stt.py`](./filters/backchannel_stt.py)
+is a `frozenset` of lowercase tokens. Edit for your domain:
 
 - **`"yes"` / `"no"` are deliberately omitted** — in a booking flow a bare
   "yes" is a real confirmation. Add them if your flow never expects
@@ -158,7 +179,8 @@ lowercase tokens. Edit for your domain:
 
 ## Strategy 2 — Buffer clearing
 
-[`buffer_clearing/agent.py`](./buffer_clearing/agent.py)
+Demo: [`buffer_clearing/agent.py`](./buffer_clearing/agent.py)
+· Portable filter: [`filters/short_utterance_buffer.py`](./filters/short_utterance_buffer.py)
 
 Listen on `session.on("user_input_transcribed")` and, while the agent is
 speaking, wipe the three transcript buffers LK's interrupt + preempt
@@ -250,6 +272,67 @@ talking.
   interrupt, which is the intended behavior. If you need to suppress
   those too, add phrase-matching logic inside the same handler.
 
+## Strategy 3 — Combined (both layered)
+
+Demo: [`combined/agent.py`](./combined/agent.py)
+· Portable filters: [`filters/backchannel_stt.py`](./filters/backchannel_stt.py),
+[`filters/short_utterance_buffer.py`](./filters/short_utterance_buffer.py)
+
+Run both filters on the same agent. The backchannel STT filter sits
+upstream and drops *known* fillers from the STT stream before they
+ever reach `audio_recognition`. The buffer-clearer sits downstream
+and mops up any *unknown* short utterance the filler list doesn't
+cover, by wiping LK's accumulation buffers before the interrupt gate
+reads them.
+
+```python
+from filters.backchannel_stt import BackchannelSTTFilterMixin
+from filters.short_utterance_buffer import install_short_utterance_filter
+
+class MyAgent(BackchannelSTTFilterMixin, Agent):
+    ...  # your prompt, tools, etc.
+
+session = AgentSession(
+    ...,
+    turn_handling={
+        ...,
+        "interruption": {..., "min_words": 2},
+    },
+)
+install_short_utterance_filter(session)
+await session.start(room=ctx.room, agent=MyAgent())
+```
+
+### Why use both
+
+The two filters cover non-overlapping failure modes:
+
+- **Strategy 1 alone** misses an unknown short word — a stutter
+  fragment ("k…"), a regional filler ("aha"), a one-word probe
+  ("wait?") — anything not in `BACKCHANNELS`. That word commits as
+  a turn and interrupts.
+- **Strategy 2 alone** filters by length, not by content. It catches
+  the unknowns Strategy 1 misses, but only after the event has
+  already accumulated into `audio_recognition` and possibly kicked
+  off a speculative LLM call (which `_cancel_preemptive_generation`
+  then has to abort, with a small race window).
+- **Combined**: Strategy 1 stops everything in `BACKCHANNELS` *before*
+  preempt-gen can fire (fast path, race-free), and Strategy 2 cleans
+  up whatever slipped past as a short non-filler.
+
+They overlap on short fillers — Strategy 1 drops the event upstream
+so Strategy 2's handler never fires for those — but the overlap is
+harmless. The cost of running both is one event-handler registration
+plus one MRO lookup per STT event.
+
+### When *not* to use combined
+
+If your domain has a closed filler vocabulary you can fully enumerate
+(call-center scripts, narrow IVR-style flows), Strategy 1 alone keeps
+you on the public API and avoids the private-attr coupling Strategy 2
+brings in. Combined makes sense when you need belt-and-suspenders
+coverage and have already accepted the `livekit-agents` version pin.
+
 ## Setup
 
 Requires Python 3.10+.
@@ -269,7 +352,7 @@ You'll need accounts / API keys from:
 - [Cartesia](https://cartesia.ai)
 - [OpenAI](https://platform.openai.com)
 
-`.env` lives at the repo root and is shared by both examples.
+`.env` lives at the repo root and is shared by all three examples.
 
 ## Run
 
@@ -281,6 +364,9 @@ python stt_node_override/agent.py dev
 
 # Strategy 2
 python buffer_clearing/agent.py dev
+
+# Strategy 3 — both filters layered
+python combined/agent.py dev
 ```
 
 Then connect a client. Easiest path is LiveKit's [agents
@@ -290,8 +376,9 @@ whose `LIVEKIT_URL` / key / secret are in your `.env` and click
 
 ## Try it out
 
-Both strategies should exhibit the same external behavior on these inputs
-(via different mechanisms — tail the log to see which filter fired):
+All three strategies should exhibit the same external behavior on these
+inputs (via different mechanisms — tail the log to see which filter
+fired):
 
 | You say (mid-agent-speech)    | Agent behavior                                    |
 |-------------------------------|---------------------------------------------------|
@@ -302,18 +389,22 @@ Both strategies should exhibit the same external behavior on these inputs
 | "suite please"                | stops & responds — real intent, passes through    |
 | (>1s after agent stops) "mhm" | responds — agent idle, no filtering applies       |
 
-When `stt_node_override/agent.py` filters something it logs
-`event_filtered transcript=...`. When `buffer_clearing/agent.py` does,
-it logs `buffer_cleared transcript=...`.
+When the backchannel STT filter drops something it logs
+`event_filtered transcript=...`. When the buffer-clearer drops
+something it logs `buffer_cleared transcript=...`. In `combined/`,
+both log lines appear depending on which filter caught the utterance.
 
 ## Files
 
-- **`stt_node_override/agent.py`** — Strategy 1 demo; `stt_node` filter +
-  session config in one file.
-- **`buffer_clearing/agent.py`** — Strategy 2 demo; `user_input_transcribed`
-  handler + session config in one file.
-- **`.env.example`** — required API keys (shared by both examples).
-- **`requirements.txt`** — pinned to the LiveKit plugin families both
+- **`filters/backchannel_stt.py`** — portable Strategy 1 filter
+  (`BackchannelSTTFilterMixin`, `BACKCHANNELS`). Drop into your project.
+- **`filters/short_utterance_buffer.py`** — portable Strategy 2 filter
+  (`install_short_utterance_filter`). Drop into your project.
+- **`stt_node_override/agent.py`** — Strategy 1 self-contained demo.
+- **`buffer_clearing/agent.py`** — Strategy 2 self-contained demo.
+- **`combined/agent.py`** — Strategy 3 self-contained demo.
+- **`.env.example`** — required API keys (shared by all three examples).
+- **`requirements.txt`** — pinned to the LiveKit plugin families the
   demos use.
 
 ## License

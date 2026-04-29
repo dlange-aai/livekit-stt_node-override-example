@@ -1,32 +1,31 @@
 """
-Hotel Booking Voice Agent — buffer-clearing variant
-===================================================
+Hotel Booking Voice Agent — combined variant
+============================================
 
-Same LiveKit + AssemblyAI + Cartesia + OpenAI stack as the
-``stt_node`` override demo, but uses a different technique: listen on
-``user_input_transcribed`` and clear LiveKit's internal
-audio_recognition buffers in-place whenever a short utterance lands
-while the agent is speaking.
+Runs both interruption-mitigation strategies on a single agent:
 
-Strategy
---------
-The ``stt_node`` override drops events upstream of audio_recognition,
-gated on a hand-curated backchannel list. This handler lets events
-accumulate normally, then wipes the buffers between LK's transcript
-emit and its interrupt-gate evaluation — gating purely on the
-configured interruption ``min_words``. Same net effect (no interrupt
-fires for short utterances) without maintaining a filler list per
-domain.
+1. **Backchannel STT filter** (``BackchannelSTTFilterMixin``) — wraps
+   ``Agent.stt_node`` and drops transcript events whose tokens are all
+   known fillers ("mhm", "um", "yeah", …). This catches the common
+   case upstream of ``audio_recognition`` so no buffer accumulates and
+   no preempt-generation kicks off.
 
-Tradeoff: reaches into private LK attributes
-(``_activity._audio_recognition._audio_*``,
-``_cancel_preemptive_generation``). Names may shift between
-livekit-agents minor versions — pin your version. Confirmed against
-``livekit-agents>=1.5``.
+2. **Short-utterance buffer-clearer**
+   (``install_short_utterance_filter``) — listens on
+   ``user_input_transcribed`` and wipes LK's accumulation buffers when
+   the utterance is below ``interruption.min_words``. This mops up
+   *unknown* short utterances the filler list doesn't cover (a new
+   stutter, a cough that transcribed as "k", a bare one-word probe
+   like "wait").
 
-The portable filter — the only thing you'd copy into your own LiveKit
-app — lives in ``filters/short_utterance_buffer.py``. Everything else
-in this file is hotel-demo glue you'd replace with your own.
+Layered defense: filter 1 stops what we can name, filter 2 catches
+what we can't. They overlap on short fillers (filter 1 wins because it
+runs upstream), but the combined coverage is broader than either
+alone.
+
+The portable filters — the modules you'd copy into your own LiveKit
+app — live in ``filters/``. Everything else in this file is
+hotel-demo glue you'd replace with your own.
 """
 
 from __future__ import annotations
@@ -47,6 +46,7 @@ from livekit.plugins import (
     openai,
 )
 
+from filters.backchannel_stt import BackchannelSTTFilterMixin
 from filters.short_utterance_buffer import install_short_utterance_filter
 
 # Uncomment for telephony calls that need noise cancellation.
@@ -80,7 +80,10 @@ booking from the top unless they ask.\
 """
 
 
-class HotelBookingAgent(Agent):
+class HotelBookingAgent(BackchannelSTTFilterMixin, Agent):
+    # MRO: BackchannelSTTFilterMixin.stt_node runs first, dropping known
+    # fillers upstream. The buffer-clearer is registered on the session
+    # below for the unknown-short-utterance case.
     def __init__(self) -> None:
         super().__init__(instructions=HOTEL_SYSTEM_PROMPT)
 
@@ -97,10 +100,6 @@ async def entrypoint(ctx: agents.JobContext):
         ),
         tts=cartesia.TTS(model="sonic-3", voice="607167f6-9bf2-473c-accc-ac7b3b66b30b"),
         llm=openai.LLM(model="gpt-4.1-nano"),
-        # VAD off — with turn_detection="stt", agent_state stays
-        # "speaking" through TTS, so the filter's speaking-gate answers
-        # reliably and short utterances can be cleared before they
-        # trigger an interrupt.
         vad=None,
         turn_handling={
             "turn_detection": "stt",
@@ -109,9 +108,9 @@ async def entrypoint(ctx: agents.JobContext):
                 "enabled": True,
                 "resume_false_interruption": True,
                 "false_interruption_timeout": 1.5,
-                # Anything shorter than this gets the buffer wiped while
-                # the agent is speaking. Default is 0 (off), so we set
-                # it explicitly to give the filter something to gate on.
+                # Required for the buffer-clearing filter's word-count
+                # gate. Anything below this gets its buffers wiped while
+                # the agent is speaking.
                 "min_words": 2,
             },
         },

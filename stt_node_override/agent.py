@@ -1,83 +1,50 @@
 """
-Hotel Booking Voice Agent — minimal demo
-========================================
+Hotel Booking Voice Agent — stt_node override variant
+=====================================================
 
-Same LiveKit + AssemblyAI + Cartesia + OpenAI stack as a typical
-production voice agent, stripped of recording, logging, and tool calls
-so the only thing on display is ``stt_node`` filtering.
-
-The filter drops STT events whose transcript is entirely backchannel /
-filler tokens (e.g. "mhm", "yeah", "okay") while the agent is speaking
-(plus a short grace window after). Without the filter, a mid-speech
-"um" commits as a one-word user turn and the LLM dutifully replies
-to it.
+LiveKit + AssemblyAI + Cartesia + OpenAI demo. The filter drops STT
+events whose transcript is entirely backchannel / filler tokens (e.g.
+"mhm", "yeah", "okay") while the agent is speaking, plus a short grace
+window after. Without the filter, a mid-speech "um" commits as a
+one-word user turn and the LLM dutifully replies to it.
 
 VAD is deliberately disabled. With ``turn_detection="stt"`` +
-``vad=None``, ``agent_state`` stays ``"speaking"`` through TTS and
-the filter's "are we speaking?" gate answers reliably. Interrupts
-still come from committed STT turns (``on_end_of_turn``), which run
-after ``stt_node`` yields — so a real user intent is caught by
-AssemblyAI's end-of-turn signal but a filler we dropped never makes
-it that far.
+``vad=None``, ``agent_state`` stays ``"speaking"`` through TTS and the
+filter's "are we speaking?" gate answers reliably. Interrupts still
+come from committed STT turns, which run *after* ``stt_node`` yields —
+so a real user intent is caught by AssemblyAI's end-of-turn signal but
+a filler we dropped never makes it that far.
+
+The portable filter — the only thing you'd copy into your own LiveKit
+app — lives in ``filters/backchannel_stt.py``. Everything else in this
+file is hotel-demo glue you'd replace with your own.
 """
 
 from __future__ import annotations
 
-import logging
-import string
-import time
-from collections.abc import AsyncIterable
+import sys
 from pathlib import Path
 
+# Make the repo root importable so ``from filters.X import Y`` works
+# regardless of where you launch this script from.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from dotenv import load_dotenv
-from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession, stt
-from livekit.agents.voice import ModelSettings
+from livekit import agents
+from livekit.agents import Agent, AgentSession
 from livekit.plugins import (
     assemblyai,
     cartesia,
     openai,
 )
 
+from filters.backchannel_stt import BackchannelSTTFilterMixin
+
 # Uncomment for telephony calls that need noise cancellation.
 # Requires the `livekit-plugins-noise-cancellation` package.
 # from livekit.plugins import noise_cancellation
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
-
-log = logging.getLogger("stt_node_override_agent")
-
-
-# Backchannels / fillers to drop while the agent is speaking.
-# "yes" / "no" are deliberately omitted — they're real confirmations.
-# Edit this set to match your domain.
-BACKCHANNELS = frozenset({
-    "mhm", "mm", "mmhm", "mmhmm",
-    "uh", "uhhuh", "huh",
-    "um", "umm", "uhm",
-    "er", "erm",
-    "hmm", "hm",
-    "ah", "oh",
-    "yeah", "yep", "yup",
-    "okay", "ok",
-    "right", "alright", "gotcha",
-})
-
-_TRANSCRIPT_TYPES = {
-    stt.SpeechEventType.INTERIM_TRANSCRIPT,
-    stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
-    stt.SpeechEventType.FINAL_TRANSCRIPT,
-}
-
-_PUNCT_STRIP = str.maketrans("", "", string.punctuation)
-
-
-def _is_all_backchannel(text: str) -> bool:
-    # True only if the transcript has content AND every token is a known
-    # filler. One non-filler word anywhere ("yeah I want the suite") flips
-    # this to False so real intents are never dropped.
-    tokens = text.lower().translate(_PUNCT_STRIP).split()
-    return bool(tokens) and all(tok in BACKCHANNELS for tok in tokens)
 
 
 HOTEL_SYSTEM_PROMPT = """\
@@ -104,54 +71,11 @@ booking from the top unless they ask.\
 """
 
 
-class HotelBookingAgent(Agent):
-    # Keep filtering for this long after agent_state flips off "speaking".
-    # Covers the latency between TTS finishing and AssemblyAI's late
-    # FINAL_TRANSCRIPT arriving — without this, a filler uttered right
-    # before TTS ends can still commit as a user turn a moment later.
-    _FILTER_GRACE_S = 1.0
-
+class HotelBookingAgent(BackchannelSTTFilterMixin, Agent):
+    # MRO puts BackchannelSTTFilterMixin.stt_node ahead of Agent's, so the
+    # backchannel filter runs on every STT event before downstream consumers.
     def __init__(self) -> None:
         super().__init__(instructions=HOTEL_SYSTEM_PROMPT)
-        self._last_speaking_at = 0.0
-
-    async def stt_node(
-        self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
-    ):
-        # Wraps the default STT pipeline and filters the event stream before
-        # it reaches downstream consumers (audio_recognition -> turn detection,
-        # interrupt gates, preemptive generation). Dropping a transcript event
-        # here means it's as if the STT never emitted it: no accumulation into
-        # the turn buffer, no interrupt, no preempt. Everything else is
-        # forwarded untouched.
-        async for ev in Agent.default.stt_node(self, audio, model_settings):
-            if self._should_drop(ev):
-                text = ev.alternatives[0].text if ev.alternatives else ""
-                log.info(
-                    "event_filtered transcript=%r ev_type=%s agent_state=%s",
-                    text, ev.type, self.session.agent_state,
-                )
-                continue
-            yield ev
-
-    def _should_drop(self, ev: stt.SpeechEvent) -> bool:
-        # Three gates, cheapest first:
-        #   1. Filter while the agent is speaking OR within a short
-        #      grace after — past the grace, a bare "yeah" is a real
-        #      confirmation and must flow through.
-        #   2. Only touch transcript events (INTERIM / PREFLIGHT / FINAL).
-        #      START_OF_SPEECH / END_OF_SPEECH carry no text and the
-        #      downstream state machine needs them.
-        #   3. Drop only when the transcript is entirely filler.
-        now = time.monotonic()
-        if self.session.agent_state == "speaking":
-            self._last_speaking_at = now
-        elif now - self._last_speaking_at > self._FILTER_GRACE_S:
-            return False
-        if ev.type not in _TRANSCRIPT_TYPES:
-            return False
-        text = ev.alternatives[0].text if ev.alternatives else ""
-        return _is_all_backchannel(text)
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -162,14 +86,14 @@ async def entrypoint(ctx: agents.JobContext):
             model="u3-rt-pro",
             min_turn_silence=100,
             max_turn_silence=1000,
-            vad_threshold=0.3
+            vad_threshold=0.3,
         ),
         tts=cartesia.TTS(model="sonic-3", voice="607167f6-9bf2-473c-accc-ac7b3b66b30b"),
         llm=openai.LLM(model="gpt-4.1-nano"),
-        # VAD is disabled — with turn_detection="stt", agent_state
-        # stays "speaking" through TTS, so the filter's speaking-gate
-        # answers reliably and fillers are dropped before they can
-        # trigger an interrupt.
+        # VAD off — with turn_detection="stt", agent_state stays
+        # "speaking" through TTS, so the filter's speaking-gate answers
+        # reliably and fillers are dropped before they trigger an
+        # interrupt.
         vad=None,
         turn_handling={
             "turn_detection": "stt",
@@ -182,10 +106,7 @@ async def entrypoint(ctx: agents.JobContext):
         },
     )
 
-    await session.start(
-        room=ctx.room,
-        agent=HotelBookingAgent()
-    )
+    await session.start(room=ctx.room, agent=HotelBookingAgent())
 
     await session.generate_reply(
         instructions='Say exactly: "I\'m from The Grandview Hotel, how can I help?"'
@@ -193,8 +114,4 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
-    agents.cli.run_app(
-        agents.WorkerOptions(
-            entrypoint_fnc=entrypoint,
-        )
-    )
+    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
